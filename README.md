@@ -1,111 +1,140 @@
-# LLM Fine-Tuning Factory
+# Production Agent Platform
 
-An **end-to-end fine-tuning pipeline** for instruction-tuning open LLMs with **LoRA/QLoRA**. Covers the full MLOps loop: YAML configs per base model → dataset preparation (instruction formatting, train/val splits, tokenization stats) → training with HuggingFace **TRL + PEFT** (gradient checkpointing, mixed precision) → evaluation hooks (perplexity, task benchmarks, eval-harness-compatible) → experiment tracking (**MLflow** or zero-dependency **JSONL**) → **versioned model registry** → adapter inference.
+A **production-grade multi-agent orchestration platform** built on LangGraph. A supervisor classifies each task and routes it to specialist agents (planner, researcher, coder, reviewer), with **human-in-the-loop approval gates** for high-stakes actions, **SQLite checkpointing** for resumable workflows, **SSE streaming** for real-time UX, and **LangSmith tracing** for observability. All agent behavior is **config-driven via YAML** — add or retune agents without touching code.
+
+## Architecture
+
+```
+                          ┌─────────────┐
+                          │ Supervisor  │  classify + plan
+                          └──────┬──────┘
+                    ┌────────────┼────────────┐
+                    ▼            ▼            ▼
+              ┌──────────┐ ┌──────────┐ ┌──────────┐
+              │Researcher│ │ Planner  │ │ Reviewer │  specialists
+              │  (low)   │ │  (low)   │ │(med/low) │
+              └────┬─────┘ └────┬─────┘ └────┬─────┘
+                   │            ▼            │
+                   │      ┌──────────┐       │
+                   │      │  Coder   │       │
+                   │      │  (high)  │       │
+                   │      └────┬─────┘       │
+                   │           ▼             │
+                   │    ┌─────────────┐      │
+                   │    │  HITL Gate  │◀─────┘ (escalations)
+                   │    │ approve /   │
+                   │    │   reject    │
+                   │    └──────┬──────┘
+                   ▼           ▼
+              ┌────────────────────────┐
+              │       Reviewer         │  verify before finalize
+              └───────────┬────────────┘
+                          ▼
+              ┌────────────────────────┐
+              │       Finalize         │  merge into final answer
+              └────────────────────────┘
+
+        SQLite checkpointer ◀── every node persists state
+        LangSmith tracer   ◀── every run traced (when configured)
+        SSE stream         ◀── node updates pushed to clients live
+```
+
+**Risk tiers** (`low` / `medium` / `high`) are declared per agent in `config/agents.yaml`. The HITL gate (`src/hitl.py`) requires explicit human approval before `high`-risk outputs are applied, and before `medium`-risk outputs when the reviewer escalates. Every decision lands in an audit log.
 
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt        # core (no GPU needed)
-python example.py                      # full dry-run: config → data → tracking → registry
-pytest tests/ -v
+pip install -r requirements.txt
+python example.py
 ```
 
-Validate a real training config without a GPU:
+No API keys needed — the demo runs on a deterministic mock LLM backend. For real models, implement the two-method `LLMBackend` protocol in `src/agents.py` (e.g. wrapping `langchain_openai.ChatOpenAI`):
 
 ```bash
-# put your instruction data at ./data/instructions.json first
-python -m src.train --config configs/lora-phi3-mini.yaml --dry-run
+export OPENAI_API_KEY=<redacted>
+export LANGSMITH_API_KEY=<redacted>   # optional, enables tracing
 ```
 
-Real training (needs GPU + training deps):
+## Example workflows
 
-```bash
-pip install torch transformers peft trl datasets   # + bitsandbytes for QLoRA
-python -m src.train --config configs/qlora-mistral-7b.yaml
+**1. Research task** (routes to researcher → reviewer):
+
+```python
+from src.config import load_config
+from src.graph import run_task
+
+config = load_config("config/agents.yaml")
+for event in run_task("Research pgvector vs Pinecone trade-offs", config, thread_id="t1"):
+    print(event)
 ```
 
-Test a fine-tuned adapter:
+**2. Code task** (routes to planner → coder → HITL gate → reviewer):
 
-```bash
-python -m src.inference --base-model mistralai/Mistral-7B-v0.3 \
-    --adapter ./registry/mistralai-mistral-7b-v0-3/v1/adapter \
-    --prompt "Explain QLoRA in one sentence."
+```python
+def my_reviewer(request):          # programmatic approver
+    return ("approve", None) if "test" in request.action_summary else ("reject", "needs tests")
+
+for event in run_task("Implement exponential-backoff retry", config,
+                      thread_id="t2", approval_reviewer=my_reviewer):
+    print(event)
 ```
 
-## Configs
+**3. Resume an interrupted run** (SQLite checkpointing):
 
-| Config | Base model | Method | Target hardware |
-|---|---|---|---|
-| `configs/lora-llama3-8b.yaml` | Meta-Llama-3-8B | LoRA (r=16) | 1× 40GB+ GPU |
-| `configs/qlora-mistral-7b.yaml` | Mistral-7B-v0.3 | QLoRA 4-bit (r=32) | 1× 24GB GPU |
-| `configs/lora-phi3-mini.yaml` | Phi-3-mini-4k | LoRA (r=8) | 1× 16GB GPU |
-
-Key knobs per config: `lora.r` / `lora_alpha` / `target_modules`, `quant.bits`, `train.learning_rate`, `train.max_seq_length`, `train.gradient_checkpointing`, `train.mixed_precision`.
-
-## Pipeline stages
-
-```
-configs/*.yaml
-      │  src/config.py — typed dataclasses, validated on load
-      ▼
-data/instructions.json  ({"instruction","input","output"} or {"text"})
-      │  src/dataset.py — format_instruction (chatml|alpaca|llama3)
-      │                   train_val_split (deterministic), tokenization_stats
-      ▼
-src/train.py  (TRL SFTTrainer + PEFT LoRA)
-      │  gradient checkpointing · bf16/fp16 · warmup · eval steps
-      ▼
-src/evaluate.py — perplexity (sliding window) + benchmark_accuracy
-      │  interface mirrors llm-eval-harness for drop-in eval suites
-      ▼
-src/tracking.py — MLflow when configured, else JSONL (events.jsonl + summary.json)
-      ▼
-src/registry.py — registry/<model-slug>/v<N>/{adapter,metadata.json,README.md}
-      ▼
-src/inference.py — load base + adapter, generate
+```python
+from src.graph import build_platform_graph
+graph = build_platform_graph(config)
+cfg = {"configurable": {"thread_id": "t2"}}
+graph.update_state(cfg, {"human_feedback": "add jitter to the backoff"})
+for event in graph.stream(None, config=cfg):
+    print(event)
 ```
 
-## Results table template
+**4. SSE streaming** (e.g. behind FastAPI):
 
-Copy into your experiment notes after each run:
+```python
+from src.streaming import stream_graph_events, create_sse_app
 
-| run_name | base_model | method | epochs | lr | train_loss | eval_ppl | benchmark | adapter |
-|---|---|---|---|---|---|---|---|---|
-| phi3-mini-lora-v1 | Phi-3-mini-4k | lora r=8 | 3 | 3e-4 | | | | registry/.../v1 |
-| mistral-7b-qlora-v1 | Mistral-7B-v0.3 | qlora r=32 | 2 | 2e-4 | | | | registry/.../v1 |
+def run(task, thread_id="web"):
+    graph = build_platform_graph(config)
+    return graph.stream(AgentState(task=task), config={"configurable": {"thread_id": thread_id}})
+
+app = create_sse_app(run)   # GET /run?task=...&thread_id=... → text/event-stream
+```
 
 ## Project layout
 
 ```
-configs/               # per-model LoRA/QLoRA YAML configs
+config/agents.yaml   # agent definitions, routing keywords, HITL policy, checkpoint/tracing settings
 src/
-  config.py            # FinetuneConfig dataclasses + YAML loader
-  dataset.py           # instruction formatting, splits, token stats
-  train.py             # TRL/PEFT training (+ --dry-run, no GPU needed)
-  evaluate.py          # perplexity + benchmark hooks
-  tracking.py          # MLflow / JSONL experiment tracker
-  registry.py          # versioned model registry
-  inference.py         # adapter inference (+ --mock offline mode)
+  config.py          # YAML loading + validation
+  state.py           # AgentState, TaskType, RiskTier
+  router.py          # heuristic + LLM-fallback task routing
+  agents.py          # planner/researcher/coder/reviewer + pluggable LLMBackend
+  hitl.py            # ApprovalGate, needs_approval policy, audit log
+  graph.py           # supervisor StateGraph, SQLite checkpointing, run_task
+  streaming.py       # SSE formatting + optional FastAPI app
+  tracing.py         # LangSmith integration (no-op when unconfigured)
 tests/
-  test_dataset.py
-  test_registry.py     # tracking + registry + eval math
-example.py             # end-to-end dry run demo
+  test_routing.py    # routing logic
+  test_hitl.py       # approval-gate policy and decisions
+example.py           # end-to-end demo (mock LLM, auto-approve HITL)
 ```
 
-## Dataset format
+## Tests
 
-`data/instructions.json` — a JSON array of either shape:
-
-```json
-[
-  {"instruction": "Summarize this ticket.", "input": "…", "output": "…"},
-  {"text": "<already formatted training string>"}
-]
+```bash
+pytest tests/ -v
 ```
 
-## Design notes
+## Config reference
 
-- **Dry-run first**: `python -m src.train --config <cfg> --dry-run` validates configs, data, tracking, and registry writes before you book GPU time.
-- **Deterministic splits**: `train_val_split` is seeded; same data + seed = same split, every run.
-- **Registry immutability**: versions are never overwritten (`FileExistsError` on collision); metadata captures config snapshot, metrics, and lineage.
-- **Eval compatibility**: `evaluate.py` exposes the same `perplexity` / `benchmark_accuracy` interface as the `llm-eval-harness` project, so one eval suite serves both.
+| Section         | Purpose                                                        |
+|---------------|----------------------------------------------------------------|
+| `supervisor`  | model + prompt for the classifying supervisor                  |
+| `agents.*`    | per-agent model, `risk_tier`, system prompt, tools             |
+| `routing`     | keyword lists mapping to `research` / `code` / `review` / `plan` |
+| `hitl`        | `approval_required_for`, `approval_on_escalation_for`, timeout  |
+| `checkpointing` | backend (`sqlite`) and DB path                              |
+| `streaming`   | transport (`sse`), heartbeat interval                          |
+| `tracing`     | provider (`langsmith`), project name                           |
