@@ -1,0 +1,78 @@
+# Agent definitions for the production agent platform.
+# Each agent: role prompt, model, risk tier (low|medium|high), and tools.
+# Risk tier drives the human-in-the-loop approval gates (see src/hitl.py).
+
+supervisor:
+  model: "gpt-4o-mini"
+  system_prompt: >-
+    You are the supervisor of a multi-agent engineering team. Classify the
+    incoming task, route it to the right specialist agent, and merge results
+    into a final answer. Prefer the cheapest capable agent.
+
+agents:
+  planner:
+    description: "Decomposes complex tasks into ordered subtasks"
+    model: "gpt-4o-mini"
+    risk_tier: "low"
+    system_prompt: >-
+      You are a planning agent. Break the user's task into a short ordered
+      list of subtasks, each assigned to exactly one specialist
+      (researcher, coder, reviewer). Output JSON: {"subtasks": [{"id": 1,
+      "agent": "researcher", "instruction": "..."}]}.
+    tools: []
+
+  researcher:
+    description: "Gathers facts from the local knowledge base and the web"
+    model: "gpt-4o-mini"
+    risk_tier: "low"
+    system_prompt: >-
+      You are a research agent. Answer with verifiable facts only. Cite
+      sources as [1], [2]. If you cannot verify a claim, say so explicitly.
+    tools: ["web_search", "knowledge_base"]
+
+  coder:
+    description: "Writes and edits code, runs tests"
+    model: "gpt-4o"
+    risk_tier: "high"
+    system_prompt: >-
+      You are a coding agent. Write minimal, tested code. Never delete data,
+      never exfiltrate secrets, never run destructive shell commands. All
+      file writes go through the approved workspace.
+    tools: ["write_file", "run_tests", "read_file"]
+
+  reviewer:
+    description: "Reviews code and plans for correctness and safety"
+    model: "gpt-4o"
+    risk_tier: "medium"
+    system_prompt: >-
+      You are a reviewer agent. Check the input for correctness, security
+      issues, and policy violations. Respond with APPROVE, REQUEST_CHANGES
+      (with reasons), or ESCALATE.
+    tools: []
+
+routing:
+  # keyword -> agent mapping used by the heuristic router (src/router.py)
+  # An LLM classifier is used when no keyword matches.
+  research: ["research", "find", "lookup", "what is", "explain", "summarize", "compare"]
+  code: ["code", "implement", "fix", "bug", "refactor", "function", "script", "test"]
+  review: ["review", "audit", "check", "verify", "approve"]
+  plan: ["plan", "design", "architect", "break down", "steps"]
+
+hitl:
+  # risk tiers that require human approval before the agent's output is applied
+  approval_required_for: ["high"]
+  # ...and which ones only need approval when the reviewer escalates
+  approval_on_escalation_for: ["medium"]
+  timeout_seconds: 300
+
+checkpointing:
+  backend: "sqlite"
+  path: "./checkpoints.db"
+
+streaming:
+  transport: "sse"
+  heartbeat_seconds: 15
+
+tracing:
+  provider: "langsmith"   # set LANGSMITH_API_KEY to enable; no-op otherwise
+  project: "production-agent-platform"
